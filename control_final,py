@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+
+import time
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32, String
+
+# =========================================================
+# PARAMETERS
+# =========================================================
+
+LINEAR_SPEED        = 0.10
+LINEAR_SPEED_YELLOW = 0.05
+MAX_ANGULAR         = 2.0
+
+# Velocidad en curva — reducida para dar tiempo a girar
+LINEAR_SPEED_CURVE  = 0.055   # ~55% de la velocidad normal
+
+# =========================================================
+# PID GAINS
+# =========================================================
+
+# Ganancias en recta (originales)
+KP = 0.0018
+KI = 0.0
+KD = 0.0012
+
+# Ganancias en curva — más agresivas para seguir el borde
+KP_CURVE = 0.0045   # 2.5x más proporcional
+KI_CURVE = 0.0
+KD_CURVE = 0.0008   # menos derivativo (evita oscilación en curva cerrada)
+
+
+# ── Suavizado de transición ──────────────────────────────
+# Las ganancias no cambian de golpe — se interpolan gradualmente.
+# ALPHA_GAINS = 1.0 → cambio instantáneo (comportamiento anterior)
+# ALPHA_GAINS = 0.05 → transición muy suave (~20 ciclos = 1 segundo)
+ALPHA_GAINS = 0.08   # velocidad de transición entre modos
+
+# Límite de cambio del error por ciclo (rate limiter)
+# Evita saltos bruscos cuando el vision_node da un error muy diferente
+# MAX_ERROR_DELTA = 999 → sin límite (comportamiento anterior)
+MAX_ERROR_DELTA = 40.0   # px máximo de cambio por ciclo (20ms)
+
+# =========================================================
+# CONTROLLER NODE
+# =========================================================
+
+class LineFollowerController(Node):
+
+    def __init__(self):
+
+        super().__init__('line_follower_controller')
+
+        # ── Variables ─────────────────────────────────────
+        self.lane_error    = 0.0
+        self.traffic_state = "RED"
+        self.curve_mode    = False   # True cuando vision_node publica "CURVA"
+
+        # ── PID ───────────────────────────────────────────
+        self.prev_error = 0.0
+        self.integral   = 0.0
+        self.prev_time  = time.time()
+
+        # Ganancias interpoladas (arrancan en valores de recta)
+        self.kp_actual  = KP
+        self.kd_actual  = KD
+
+        # Error suavizado para el rate limiter
+        self.error_suave = 0.0
+
+        # ── Subscribers ───────────────────────────────────
+        self.create_subscription(Float32, '/lane_error',          self.lane_error_callback, 10)
+        self.create_subscription(String,  '/traffic_light_state', self.traffic_callback,    10)
+        self.create_subscription(String,  '/curve_mode',          self.curve_callback,      10)
+
+        # ── Publisher ─────────────────────────────────────
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # ── Timer ─────────────────────────────────────────
+        self.timer = self.create_timer(0.05, self.control_loop)
+
+        self.get_logger().info('PID Line Follower Controller Started')
+
+    # =====================================================
+    # CALLBACKS
+    # =====================================================
+
+    def lane_error_callback(self, msg):
+        raw = msg.data
+        # Rate limiter: limitar cambio máximo por ciclo
+        delta = raw - self.error_suave
+        delta = max(min(delta, MAX_ERROR_DELTA), -MAX_ERROR_DELTA)
+        self.error_suave += delta
+        self.lane_error   = self.error_suave
+
+    def curve_callback(self, msg):
+        self.curve_mode = (msg.data == "CURVA")
+
+    def traffic_callback(self, msg):
+        detected = msg.data.upper()
+        if detected == "RED":
+            self.traffic_state = "RED"
+        elif detected == "GREEN":
+            self.traffic_state = "GREEN"
+        elif detected == "YELLOW":
+            if self.traffic_state == "GREEN":
+                self.traffic_state = "YELLOW"
+
+    # =====================================================
+    # PID
+    # =====================================================
+
+    def compute_pid(self):
+
+        current_time = time.time()
+        dt = current_time - self.prev_time
+        if dt <= 0.0:
+            dt = 0.0001
+
+        error = self.lane_error
+
+        # Interpolar ganancias suavemente hacia el objetivo
+        kp_target = KP_CURVE if self.curve_mode else KP
+        kd_target = KD_CURVE if self.curve_mode else KD
+        self.kp_actual = ALPHA_GAINS * kp_target + (1 - ALPHA_GAINS) * self.kp_actual
+        self.kd_actual = ALPHA_GAINS * kd_target + (1 - ALPHA_GAINS) * self.kd_actual
+
+        kp = self.kp_actual
+        ki = KI_CURVE if self.curve_mode else KI
+        kd = self.kd_actual
+
+        # ── Proporcional ──────────────────────────────────
+        p = kp * error
+
+        # ── Integral ──────────────────────────────────────
+        # Resetear integral al cambiar de modo para evitar windup
+        self.integral += error * dt
+        self.integral  = max(min(self.integral, 300), -300)
+        i = ki * self.integral
+
+        # ── Derivativo ────────────────────────────────────
+        derivative = (error - self.prev_error) / dt
+        d = kd * derivative
+
+        output = p + i + d
+
+        self.prev_error = error
+        self.prev_time  = current_time
+
+        return output
+
+    # =====================================================
+    # CONTROL LOOP
+    # =====================================================
+
+    def control_loop(self):
+
+        cmd = Twist()
+
+        error_abs      = abs(self.lane_error)
+        angular_control = -self.compute_pid()
+
+        # ── Velocidad lineal ──────────────────────────────
+        # Velocidad objetivo según modo
+        if self.curve_mode:
+            linear_target = LINEAR_SPEED_CURVE
+        else:
+            speed_factor  = 1.0 - min(error_abs / 180.0, 0.80)
+            linear_target = LINEAR_SPEED * speed_factor
+            if error_abs > 120:
+                angular_control *= 1.6
+
+        # Interpolar velocidad suavemente (evita acelerones/frenazos bruscos)
+        if not hasattr(self, 'linear_actual'):
+            self.linear_actual = linear_target
+        self.linear_actual = ALPHA_GAINS * linear_target + (1 - ALPHA_GAINS) * self.linear_actual
+        linear = self.linear_actual
+
+        # ── Aplicar semáforo ──────────────────────────────
+        if self.traffic_state == "RED":
+            cmd.linear.x  = 0.0
+            cmd.angular.z = 0.0
+
+        elif self.traffic_state == "YELLOW":
+            cmd.linear.x  = LINEAR_SPEED_YELLOW * (0.5 if self.curve_mode else 1.0)
+            cmd.angular.z = angular_control
+
+        elif self.traffic_state == "GREEN":
+            cmd.linear.x  = linear
+            cmd.angular.z = angular_control
+
+        else:
+            cmd.linear.x  = 0.0
+            cmd.angular.z = 0.0
+
+        # ── Limitar angular ───────────────────────────────
+        cmd.angular.z = max(min(cmd.angular.z, MAX_ANGULAR), -MAX_ANGULAR)
+
+        self.cmd_pub.publish(cmd)
+
+        self.get_logger().info(
+            f'Light={self.traffic_state} | '
+            f'Modo={"CURVA" if self.curve_mode else "NORMAL"} | '
+            f'Error={self.lane_error:.1f} | '
+            f'V={cmd.linear.x:.3f} | '
+            f'W={cmd.angular.z:.3f}'
+        )
+
+    # =====================================================
+    # STOP
+    # =====================================================
+
+    def stop_robot(self):
+        cmd = Twist()
+        self.cmd_pub.publish(cmd)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LineFollowerController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop_robot()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
