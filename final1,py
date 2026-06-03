@@ -1,0 +1,883 @@
+"""
+vision_node.py — Jetson CSI + YOLOv8 señales
++ Máscaras binarias por votación (sin Canny) para evitar salidas de pista
++ Detección de cruce horizontal por filas
++ FSM de señales: señal MÁS CERCANA (mayor bbox) toma prioridad siempre
+
+CAMBIOS respecto a versión anterior:
+- _yolo_worker: expone también last_sign_bbox_h para que la FSM sepa
+  el tamaño del bbox de la señal candidata actual
+- _actualizar_sign_fsm: si llega una señal diferente con bbox_h MAYOR
+  que la candidata actual, la reemplaza inmediatamente (resetea contador).
+  Esto garantiza que la señal más cercana siempre gana prioridad.
+"""
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32, String
+import cv2
+import numpy as np
+import threading
+import time
+import os
+from ultralytics import YOLO
+
+Gst.init(None)
+
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+
+FRAME_WIDTH   = 640
+FRAME_HEIGHT  = 480
+DEZOOM        = 1.0
+
+# ── Detección de línea ────────────────────────────────────
+BLACK_THRESHOLD        = 60
+SCAN_Y_RATIO           = 0.75
+CENTER_MIN_RATIO       = 0.20
+CENTER_MAX_RATIO       = 0.80
+ALPHA_SMOOTH           = 0.25
+BUFFER_SIZE            = 6
+MIN_GROUP_WIDTH        = 1
+MAX_GROUP_WIDTH        = 90
+UMBRAL_ENTRADA_CURVA   = 35
+FRAMES_CONFIRMA_CURVA  = 4
+FRAMES_CONFIRMA_NORMAL = 8
+OFFSET_BORDE           = 100
+MAX_ERROR_CURVA        = 140
+MAX_LOST_FRAMES        = 25
+MIN_AREA_LIGHT         = 300
+CONFIRM_FRAMES         = 5
+ROI_SPLIT              = 0.55
+
+# ── Detección de línea punteada ───────────────────────────
+MIN_GRUPOS_PUNTEADO    = 3
+FRAMES_CONFIRMA_DASH   = 6
+PAUSA_DASH_SEGUNDOS    = 2.0
+VENTANA_RECTO_SEGUNDOS = 3.0
+
+# ── Detección cruce horizontal por filas ──────────────────
+CRUCE_RATIO          = 0.60
+CRUCE_FRAMES_CONFIRM = 6
+
+# ── YOLOv8 ───────────────────────────────────────────────
+YOLO_MODEL   = '/home/puzzlebot/models/completo.onnx'
+YOLO_EVERY_N = 5
+YOLO_CONF    = 0.35
+
+# Clases de completo.onnx (nc: 7)
+# idx: ['ahead_only', 'const_sign', 'give_way', 'left', 'right', 'roundabout', 'stop_sign']
+SIGN_NAMES = {
+    0: "Ahead Only",
+    1: "Construction",
+    2: "Give Way",
+    3: "Turn left ahead",
+    4: "Turn right ahead",
+    5: "Roundabout",
+    6: "Stop",
+}
+
+# ── Altura real aproximada de las señales (cm) ────────────
+# dist ∝ SIGN_REAL_HEIGHT_CM / bbox_h_px  (constante → solo importa proporción)
+SIGN_REAL_HEIGHT_CM = 30.0
+
+# ── Corrección de color cámara ────────────────────────────
+RED_CORRECTION = 0.75
+
+# ── Comportamiento por señal ──────────────────────────────
+SIGN_CONFIRM_FRAMES = 4    # frames consecutivos para confirmar señal
+SIGN_COOLDOWN_S     = 2.0  # segundos de espera tras ejecutar una señal
+TURN_DURATION_S     = 2.0  # duración del giro (s)
+TURN_REINCORP_S     = 2.0  # ventana de reincorporación tras giro (s)
+STOP_DURATION_S     = 4.0  # duración de stop (s)
+SLOW_SPEED_RATIO    = 0.50 # reducción de velocidad para roadwork
+
+
+# =========================================================
+# NODO
+# =========================================================
+
+class VisionNode(Node):
+
+    def __init__(self):
+        super().__init__('vision_node')
+
+        self.has_display = os.environ.get('DISPLAY') is not None
+        if self.has_display:
+            self.get_logger().info(f"Display detectado: {os.environ.get('DISPLAY')}")
+        else:
+            self.get_logger().warn("Sin DISPLAY — imshow desactivado")
+
+        # ── Publishers ────────────────────────────────────
+        self.lane_pub  = self.create_publisher(Float32, '/lane_error',          10)
+        self.light_pub = self.create_publisher(String,  '/traffic_light_state', 10)
+        self.curve_pub = self.create_publisher(String,  '/curve_mode',          10)
+        self.sign_pub  = self.create_publisher(String,  '/traffic_sign',        10)
+        self.dash_pub  = self.create_publisher(String,  '/dash_state',          10)
+        self.cmd_pub   = self.create_publisher(String,  '/sign_command',        10)
+        self.speed_pub = self.create_publisher(Float32, '/speed_multiplier',    10)
+
+        # ── Cámara CSI via GStreamer ───────────────────────
+        self.gst_pipeline = Gst.parse_launch(
+            "nvarguscamerasrc sensor-mode=4 wbmode=1 ! "
+            "video/x-raw(memory:NVMM), format=NV12, width=1280, height=720, framerate=60/1 ! "
+            "nvvidconv ! "
+            "video/x-raw, format=I420 ! "
+            "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
+        )
+        self.sink = self.gst_pipeline.get_by_name('sink')
+
+        ret = self.gst_pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            self.get_logger().error("ERROR: No se pudo iniciar el pipeline GStreamer")
+        else:
+            self.get_logger().info("Cámara CSI iniciada")
+
+        state_ret, _state, _pending = self.gst_pipeline.get_state(timeout=5 * Gst.SECOND)
+        if state_ret != Gst.StateChangeReturn.SUCCESS:
+            self.get_logger().warn("Pipeline tardó en iniciar, continuando...")
+
+        # ── YOLOv8 ───────────────────────────────────────
+        self.yolo             = YOLO(YOLO_MODEL, task='detect')
+        self.last_sign        = "NONE"
+        self.last_sign_bbox_h = 0.0   # ← altura bbox de la señal más cercana detectada
+        self.last_boxes       = []
+        self.yolo_frame       = None
+        self.yolo_lock        = threading.Lock()
+        self.yolo_running     = True
+        self.yolo_thread      = threading.Thread(target=self._yolo_worker, daemon=True)
+        self.yolo_thread.start()
+        self.get_logger().info("YOLOv8 iniciado")
+
+        # ── Estado seguidor ───────────────────────────────
+        self.last_error        = 0.0
+        self.error_buffer      = []
+        self.lost_frames       = 0
+        self.modo              = "NORMAL"
+        self.lado_curva        = None
+        self.frames_error_alto = 0
+        self.error_history     = []
+        self.frames_par_visto  = 0
+        self.frame_n           = 0
+
+        # ── FSM semáforo ──────────────────────────────────
+        self.fsm_state       = "NONE"
+        self.candidate       = "NONE"
+        self.candidate_count = 0
+
+        # ── Estado línea punteada ─────────────────────────
+        self.dash_estado        = "SOLIDA"
+        self.dash_frames_count  = 0
+        self.dash_tiempo_inicio = 0.0
+
+        # ── Cruce horizontal ──────────────────────────────
+        self.frames_cruce = 0
+        self.en_cruce     = False
+
+        # ── FSM de señales ────────────────────────────────
+        self._sign_candidate        = "NONE"
+        self._sign_candidate_count  = 0
+        self._sign_candidate_bbox_h = 0.0  # ← bbox_h del candidato actual
+        self.sign_confirmado        = "NONE"
+        self._sign_cooldown_end     = 0.0
+        self._sign_action_state     = "IDLE"
+        self._sign_action_end       = 0.0
+        self._sign_turn_dir         = None
+        self._speed_multiplier      = 1.0
+
+        self.timer = self.create_timer(0.03, self.process_frame)
+
+    # =====================================================
+    # YOLO WORKER
+    # Selecciona la señal más cercana = mayor altura de bbox.
+    # Expone last_sign_bbox_h para que la FSM pueda comparar.
+    # =====================================================
+
+    def _yolo_worker(self):
+        while self.yolo_running:
+            with self.yolo_lock:
+                frame = self.yolo_frame
+                if frame is not None:
+                    self.yolo_frame = None
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            try:
+                results = self.yolo.predict(frame, imgsz=320, conf=YOLO_CONF, verbose=False)
+                boxes   = results[0].boxes
+                if len(boxes) > 0:
+                    def bbox_h_px(b):
+                        x1, y1, x2, y2 = b.xyxy[0]
+                        return float(y2 - y1)
+
+                    # Señal más cercana = mayor altura de bbox
+                    best   = max(boxes, key=bbox_h_px)
+                    best_h = bbox_h_px(best)
+
+                    self.last_sign        = SIGN_NAMES.get(int(best.cls[0]), f"cls_{int(best.cls[0])}")
+                    self.last_sign_bbox_h = best_h
+
+                    dist_est = SIGN_REAL_HEIGHT_CM / best_h if best_h > 0 else float('inf')
+                    self.get_logger().debug(
+                        f"Señal: {self.last_sign} | bbox_h={best_h:.1f}px | dist∝{dist_est:.2f}"
+                    )
+
+                    self.last_boxes = [(
+                        tuple(map(int, box.xyxy[0])),
+                        SIGN_NAMES.get(int(box.cls[0]), f"cls_{int(box.cls[0])}"),
+                        float(box.conf[0]),
+                        float(SIGN_REAL_HEIGHT_CM / bbox_h_px(box))
+                        if bbox_h_px(box) > 0 else float('inf')
+                    ) for box in boxes]
+                else:
+                    self.last_sign        = "NONE"
+                    self.last_sign_bbox_h = 0.0
+                    self.last_boxes       = []
+            except Exception as e:
+                self.get_logger().error(f"YOLO error: {e}")
+                time.sleep(0.05)
+
+    # =====================================================
+    # FSM DE SEÑALES — con prioridad por distancia (bbox_h)
+    #
+    # Regla de prioridad:
+    #   Si llega una señal DIFERENTE al candidato actual
+    #   Y su bbox_h es MAYOR (más cercana), la reemplaza
+    #   inmediatamente y reinicia el contador de confirmación.
+    #   Si su bbox_h es menor o igual, se ignora.
+    #
+    # Esto evita que una señal lejana bloquee a una cercana
+    # que aparece mientras se acumulan frames de confirmación.
+    # =====================================================
+
+    def _actualizar_sign_fsm(self):
+        now      = time.time()
+        detected = self.last_sign
+        det_h    = self.last_sign_bbox_h   # altura bbox de la detección actual
+
+        # ── Acciones en curso (no interrumpir) ────────────
+        if self._sign_action_state == "STOPPING":
+            if now >= self._sign_action_end:
+                self._sign_action_state = "IDLE"
+                self._sign_cooldown_end = now + SIGN_COOLDOWN_S
+                self.sign_confirmado    = "NONE"
+                self.cmd_pub.publish(String(data="STOP_END"))
+                self.get_logger().info("→ STOP terminado")
+            return self.sign_confirmado
+
+        elif self._sign_action_state == "TURNING":
+            if now >= self._sign_action_end:
+                self._sign_action_state = "REINCORP"
+                self._sign_action_end   = now + TURN_REINCORP_S
+                self.cmd_pub.publish(String(data="TURN_END"))
+                self.get_logger().info("→ Giro terminado, buscando línea...")
+            return self.sign_confirmado
+
+        elif self._sign_action_state == "REINCORP":
+            if now >= self._sign_action_end:
+                self._sign_action_state = "IDLE"
+                self._sign_cooldown_end = now + SIGN_COOLDOWN_S
+                self.sign_confirmado    = "NONE"
+                self.cmd_pub.publish(String(data="REINCORP_END"))
+                self.get_logger().info("→ Reincorporación terminada")
+            return self.sign_confirmado
+
+        elif self._sign_action_state == "SLOWING":
+            if detected == "NONE":
+                if not hasattr(self, '_slow_last_seen'):
+                    self._slow_last_seen = now
+                elif now - self._slow_last_seen > 3.0:
+                    self._sign_action_state = "IDLE"
+                    self._speed_multiplier  = 1.0
+                    self._sign_cooldown_end = now + SIGN_COOLDOWN_S
+                    self.sign_confirmado    = "NONE"
+                    self.speed_pub.publish(Float32(data=1.0))
+                    self.cmd_pub.publish(String(data="SLOW_END"))
+                    self.get_logger().info("→ SLOW terminado")
+                    if hasattr(self, '_slow_last_seen'):
+                        del self._slow_last_seen
+            else:
+                if hasattr(self, '_slow_last_seen'):
+                    del self._slow_last_seen
+            return self.sign_confirmado
+
+        # ── En cooldown ───────────────────────────────────
+        if now < self._sign_cooldown_end:
+            return self.sign_confirmado
+
+        # ── Detección y confirmación con prioridad ────────
+        if detected != "NONE":
+            if detected == self._sign_candidate:
+                # Misma señal — acumular frame de confirmación
+                self._sign_candidate_count  += 1
+                # Actualizar bbox_h al valor más reciente (puede crecer si se acerca)
+                self._sign_candidate_bbox_h  = det_h
+                if self._sign_candidate_count >= SIGN_CONFIRM_FRAMES:
+                    self.sign_confirmado        = detected
+                    self._sign_candidate        = "NONE"
+                    self._sign_candidate_count  = 0
+                    self._sign_candidate_bbox_h = 0.0
+                    self._ejecutar_accion(detected, now)
+            else:
+                # Señal diferente — solo reemplaza si es MÁS CERCANA (bbox_h mayor)
+                if det_h > self._sign_candidate_bbox_h:
+                    if self._sign_candidate != "NONE":
+                        self.get_logger().info(
+                            f"Prioridad: '{detected}' (h={det_h:.0f}px) reemplaza "
+                            f"'{self._sign_candidate}' (h={self._sign_candidate_bbox_h:.0f}px)"
+                        )
+                    self._sign_candidate        = detected
+                    self._sign_candidate_count  = 1
+                    self._sign_candidate_bbox_h = det_h
+                # Si es más lejana, se ignora completamente
+        else:
+            # Sin detección — limpiar candidato
+            self._sign_candidate        = "NONE"
+            self._sign_candidate_count  = 0
+            self._sign_candidate_bbox_h = 0.0
+
+        return self.sign_confirmado
+
+    def _ejecutar_accion(self, sign, now):
+        self.get_logger().info(f"→ SEÑAL ejecutando: {sign}")
+
+        if sign in ("Turn left ahead", "Turn right ahead"):
+            self._sign_turn_dir     = "LEFT" if "left" in sign.lower() else "RIGHT"
+            self._sign_action_state = "TURNING"
+            self._sign_action_end   = now + TURN_DURATION_S
+            self.cmd_pub.publish(String(data=f"TURN_{self._sign_turn_dir}"))
+
+        elif sign == "Stop":
+            self._sign_action_state = "STOPPING"
+            self._sign_action_end   = now + STOP_DURATION_S
+            self.cmd_pub.publish(String(data="STOP"))
+
+        elif sign == "Ahead Only":
+            # Solo publicar y dejar pasar — sin acción de movimiento
+            self._sign_cooldown_end = now + SIGN_COOLDOWN_S
+            self.sign_confirmado    = "NONE"
+            self.cmd_pub.publish(String(data="AHEAD_ONLY"))
+
+        elif sign == "Give Way":
+            # Reducir velocidad brevemente y ceder el paso
+            self._sign_action_state = "SLOWING"
+            self._speed_multiplier  = SLOW_SPEED_RATIO
+            self.speed_pub.publish(Float32(data=SLOW_SPEED_RATIO))
+            self.cmd_pub.publish(String(data="GIVE_WAY"))
+
+        elif sign == "Construction":
+            # Zona de obras: reducir velocidad mientras sea visible
+            self._sign_action_state = "SLOWING"
+            self._speed_multiplier  = SLOW_SPEED_RATIO
+            self.speed_pub.publish(Float32(data=SLOW_SPEED_RATIO))
+            self.cmd_pub.publish(String(data="SLOW"))
+
+        elif sign == "Roundabout":
+            # Informativo: publicar y continuar sin acción especial
+            self._sign_cooldown_end = now + SIGN_COOLDOWN_S
+            self.sign_confirmado    = "NONE"
+            self.cmd_pub.publish(String(data="ROUNDABOUT"))
+
+    # =====================================================
+    # LEER FRAME
+    # =====================================================
+
+    def _leer_frame(self):
+        sample = self.sink.emit('try-pull-sample', 100 * Gst.MSECOND)
+        if sample is None:
+            return None
+        buf  = sample.get_buffer()
+        caps = sample.get_caps()
+        w    = caps.get_structure(0).get_value('width')
+        h    = caps.get_structure(0).get_value('height')
+        ok, mi = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return None
+        yuv = np.frombuffer(mi.data, dtype=np.uint8).reshape((h * 3 // 2, w)).copy()
+        buf.unmap(mi)
+        frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+        frame[:, :, 2] = (frame[:, :, 2] * RED_CORRECTION).astype(np.uint8)
+        return cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+    # =====================================================
+    # CLEAN MASK
+    # =====================================================
+
+    def clean_mask(self, mask):
+        k    = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        return mask
+
+    # =====================================================
+    # PREPROCESADO — votación de 3 máscaras binarias
+    # =====================================================
+
+    def _preparar_thresh(self, frame):
+        h, w    = frame.shape[:2]
+        split_y = int(h * ROI_SPLIT)
+        roi     = frame[split_y:h, :]
+        gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur    = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        _, thr_fixed = cv2.threshold(blur, BLACK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+        _, thr_otsu  = cv2.threshold(blur, 0, 255,
+                                     cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        thr_adapt    = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=31, C=8
+        )
+
+        vote = (thr_fixed.astype(np.uint16) +
+                thr_otsu.astype(np.uint16) +
+                thr_adapt.astype(np.uint16)) // 255
+        thr = np.where(vote >= 2, np.uint8(255), np.uint8(0))
+
+        k_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 12))
+        thr    = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, k_vert)
+        thr    = self.clean_mask(thr)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thr)
+        clean = np.zeros_like(thr)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= 40:
+                clean[labels == i] = 255
+        thr = clean
+
+        return roi, thr, w
+
+    # =====================================================
+    # DETECTAR CRUCE HORIZONTAL
+    # =====================================================
+
+    def _detectar_cruce_filas(self, thr):
+        h, w    = thr.shape
+        umbral  = int(w * CRUCE_RATIO)
+        roi_inf = thr[h // 2:, :]
+        suma    = np.sum(roi_inf > 0, axis=1)
+        hay_cruce = bool(np.any(suma > umbral))
+        if hay_cruce:
+            self.frames_cruce += 1
+        else:
+            self.frames_cruce = max(0, self.frames_cruce - 1)
+        self.en_cruce = self.frames_cruce >= CRUCE_FRAMES_CONFIRM
+        return self.en_cruce
+
+    def _fila_combinada(self, thr):
+        h     = thr.shape[0]
+        filas = [int(h * r) for r in (0.50, 0.60, 0.70, 0.80, 0.90)]
+        combinada = np.zeros(thr.shape[1], dtype=np.uint8)
+        for fy in filas:
+            combinada = np.bitwise_or(combinada, thr[fy])
+        return combinada, filas[2]
+
+    # =====================================================
+    # DETECCIÓN DE ZONA PUNTEADA
+    # =====================================================
+
+    def _es_zona_punteada(self, row, w):
+        c_min = int(w * CENTER_MIN_RATIO)
+        c_max = int(w * CENTER_MAX_RATIO)
+        px    = np.where(row[c_min:c_max] > 0)[0]
+        if len(px) < 2:
+            return False
+        px     = px + c_min
+        grupos = self._filtrar_grupos(self._agrupar(px))
+        return len(grupos) >= MIN_GRUPOS_PUNTEADO
+
+    # =====================================================
+    # FSM LÍNEA PUNTEADA
+    # =====================================================
+
+    def _actualizar_dash_fsm(self, row, w):
+        ahora   = time.time()
+        es_dash = self._es_zona_punteada(row, w)
+
+        if self.dash_estado == "SOLIDA":
+            if es_dash:
+                self.dash_frames_count += 1
+                if self.dash_frames_count >= FRAMES_CONFIRMA_DASH:
+                    self.dash_estado        = "PAUSA"
+                    self.dash_tiempo_inicio = ahora
+                    self.dash_frames_count  = 0
+                    self.get_logger().info("→ DASH detectado: PAUSA 2s")
+            else:
+                self.dash_frames_count = 0
+            return False, None
+
+        elif self.dash_estado == "PAUSA":
+            elapsed = ahora - self.dash_tiempo_inicio
+            if elapsed < PAUSA_DASH_SEGUNDOS:
+                return True, 0.0
+            else:
+                self.dash_estado        = "RECTO"
+                self.dash_tiempo_inicio = ahora
+                self.get_logger().info("→ DASH: fin pausa, avanzando RECTO")
+                return True, None
+
+        elif self.dash_estado == "RECTO":
+            elapsed = ahora - self.dash_tiempo_inicio
+            if elapsed < VENTANA_RECTO_SEGUNDOS:
+                return True, None
+            else:
+                self.dash_estado       = "SOLIDA"
+                self.dash_frames_count = 0
+                self.get_logger().info("→ DASH: ventana recto terminada")
+                return False, None
+
+        return False, None
+
+    # =====================================================
+    # DETECT LANE
+    # =====================================================
+
+    def detect_lane(self, frame):
+        roi, thr, w = self._preparar_thresh(frame)
+        row, scan_y = self._fila_combinada(thr)
+
+        hay_cruce = self._detectar_cruce_filas(thr)
+        if hay_cruce:
+            self.frames_error_alto = 0
+            cv2.putText(roi, "CRUCE-H", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            return self._suavizar(0.0)
+
+        suprimir_curva, error_override = self._actualizar_dash_fsm(row, w)
+
+        if suprimir_curva and error_override is not None:
+            cv2.putText(roi, "DASH PAUSA", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            return 0.0
+
+        if self.modo == "NORMAL":
+            par = self._buscar_par_central(row, w)
+            if par is not None:
+                left_x, right_x, center_lane = par
+                self.lost_frames      = 0
+                self.frames_par_visto = 0
+                error = float(center_lane - (w // 2))
+
+                if not suprimir_curva:
+                    if abs(error) >= UMBRAL_ENTRADA_CURVA:
+                        self.frames_error_alto += 1
+                        if self.frames_error_alto >= FRAMES_CONFIRMA_CURVA:
+                            self.lado_curva        = "der" if error > 0 else "izq"
+                            self.modo              = "CURVA"
+                            self.frames_error_alto = 0
+                            self.frames_par_visto  = 0
+                            self.error_history     = []
+                            self.get_logger().info(f"→ CURVA ({self.lado_curva})")
+                    else:
+                        self.frames_error_alto = 0
+                else:
+                    self.frames_error_alto = 0
+                    cv2.putText(roi, "DASH RECTO", (10, 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+                error_final = self._suavizar(error)
+                cv2.line(roi, (left_x,      0), (left_x,      roi.shape[0]), (255,   0,   0), 2)
+                cv2.line(roi, (right_x,     0), (right_x,     roi.shape[0]), (255,   0,   0), 2)
+                cv2.line(roi, (center_lane, 0), (center_lane, roi.shape[0]), (0,     0, 255), 3)
+                cv2.circle(roi, (center_lane, scan_y), 8, (0, 255, 0), -1)
+                return error_final
+            else:
+                self.lost_frames += 1
+                if self.lost_frames > MAX_LOST_FRAMES:
+                    self._resetear()
+                return float(self.last_error)
+
+        else:  # CURVA
+            par = self._buscar_par_central(row, w, zona=(0.10, 0.90))
+            if par is not None:
+                left_x, right_x, center_lane = par
+                sep = abs(right_x - left_x)
+                bien_centrado = (
+                    sep > 40 and
+                    int(w * 0.20) < center_lane < int(w * 0.80)
+                )
+                if bien_centrado:
+                    self.frames_par_visto += 1
+                    if self.frames_par_visto >= FRAMES_CONFIRMA_NORMAL:
+                        self.modo              = "NORMAL"
+                        self.lado_curva        = None
+                        self.frames_par_visto  = 0
+                        self.frames_error_alto = 0
+                        self.lost_frames       = 0
+                        self.get_logger().info("→ NORMAL (reincorporado)")
+                        error = float(center_lane - (w // 2))
+                        return self._suavizar(error)
+                else:
+                    self.frames_par_visto = 0
+            else:
+                self.frames_par_visto = 0
+
+            error_borde = self._seguir_borde(row, w, roi, scan_y)
+            if error_borde is not None:
+                self.lost_frames = 0
+                return self._suavizar(error_borde)
+            else:
+                self.lost_frames += 1
+                if self.lost_frames > MAX_LOST_FRAMES:
+                    self._resetear()
+                return float(self.last_error)
+
+    # =====================================================
+    # BUSCAR PAR CENTRAL
+    # =====================================================
+
+    def _buscar_par_central(self, row, w, zona=None):
+        if zona is None:
+            zona = (CENTER_MIN_RATIO, CENTER_MAX_RATIO)
+        c_min   = int(w * zona[0])
+        c_max   = int(w * zona[1])
+        px      = np.where(row[c_min:c_max] > 0)[0]
+        if len(px) < 2:
+            return None
+        px      = px + c_min
+        grupos  = self._filtrar_grupos(self._agrupar(px))
+        centros = [int(np.mean(g)) for g in grupos]
+        n       = len(centros)
+        if n == 0:   return None
+        if n == 1:   cx = centros[0]; return (cx, cx, cx)
+        elif n == 2: left, right = centros[0], centros[1]
+        elif n == 3:
+            cf    = w // 2
+            pares = [(centros[0], centros[1]), (centros[1], centros[2])]
+            left, right = min(pares, key=lambda p: abs((p[0]+p[1])//2 - cf))
+        else:
+            mid = len(centros) // 2
+            left, right = centros[mid-1], centros[mid]
+        if abs(right - left) < 20:
+            return None
+        return (left, right, (left + right) // 2)
+
+    # =====================================================
+    # SEGUIR BORDE EXTERIOR
+    # =====================================================
+
+    def _seguir_borde(self, row, w, roi, scan_y):
+        c_min   = int(w * 0.03)
+        c_max   = int(w * 0.97)
+        px      = np.where(row[c_min:c_max] > 0)[0]
+        if len(px) < 2:
+            return None
+        px      = px + c_min
+        grupos  = self._filtrar_grupos(self._agrupar(px))
+        centros = [int(np.mean(g)) for g in grupos]
+        if not centros:
+            return None
+        cf = w // 2
+        if self.lado_curva == "der":
+            borde_x  = max(centros)
+            objetivo = borde_x - OFFSET_BORDE
+        else:
+            borde_x  = min(centros)
+            objetivo = borde_x + OFFSET_BORDE
+        objetivo = int(np.clip(objetivo, 0, w - 1))
+        error    = float(np.clip(float(objetivo - cf), -MAX_ERROR_CURVA, MAX_ERROR_CURVA))
+        cv2.line(roi, (borde_x,  0), (borde_x,  roi.shape[0]), (0, 100, 255), 3)
+        cv2.line(roi, (objetivo, 0), (objetivo, roi.shape[0]), (0, 255, 255), 2)
+        cv2.circle(roi, (objetivo, scan_y), 8, (0, 200, 255), -1)
+        return error
+
+    # =====================================================
+    # SUAVIZADO
+    # =====================================================
+
+    def _suavizar(self, error):
+        ewma = ALPHA_SMOOTH * self.last_error + (1 - ALPHA_SMOOTH) * error
+        self.last_error = ewma
+        self.error_buffer.append(ewma)
+        if len(self.error_buffer) > BUFFER_SIZE:
+            self.error_buffer.pop(0)
+        return float(np.mean(self.error_buffer))
+
+    def _resetear(self):
+        self.last_error        = 0.0
+        self.error_buffer      = []
+        self.lost_frames       = 0
+        self.modo              = "NORMAL"
+        self.lado_curva        = None
+        self.frames_par_visto  = 0
+        self.frames_error_alto = 0
+
+    # =====================================================
+    # AGRUPAR + FILTRAR
+    # =====================================================
+
+    def _agrupar(self, pixels, gap=25):
+        if len(pixels) == 0:
+            return []
+        grupos, actual = [], [pixels[0]]
+        for px in pixels[1:]:
+            if px - actual[-1] <= gap:
+                actual.append(px)
+            else:
+                grupos.append(np.array(actual))
+                actual = [px]
+        grupos.append(np.array(actual))
+        return grupos
+
+    def _filtrar_grupos(self, grupos):
+        return [g for g in grupos
+                if MIN_GROUP_WIDTH <= int(g[-1]) - int(g[0]) + 1 <= MAX_GROUP_WIDTH]
+
+    # =====================================================
+    # TRAFFIC LIGHT
+    # =====================================================
+
+    def detect_traffic_light(self, frame):
+        h, w    = frame.shape[:2]
+        split_y = int(h * ROI_SPLIT)
+        roi     = frame[0:split_y, :]
+        hsv     = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        red1    = cv2.inRange(hsv, np.array([0,   120,  90]), np.array([10,  255, 255]))
+        red2    = cv2.inRange(hsv, np.array([170, 120,  90]), np.array([179, 255, 255]))
+        red     = self.clean_mask(red1 | red2)
+        yellow  = self.clean_mask(cv2.inRange(hsv, np.array([18, 120, 120]), np.array([35, 255, 255])))
+        green   = self.clean_mask(cv2.inRange(hsv, np.array([45,  80,  80]), np.array([85, 255, 255])))
+        masks   = {"RED": red, "YELLOW": yellow, "GREEN": green}
+        best_color, best_area, best_box = "NONE", 0, None
+        for color, mask in masks.items():
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area > MIN_AREA_LIGHT and area > best_area:
+                    best_area, best_color, best_box = area, color, cv2.boundingRect(c)
+        if best_box is not None:
+            x, y, bw, bh = best_box
+            cv2.rectangle(roi, (x, y), (x+bw, y+bh), (0, 255, 0), 3)
+            cv2.putText(roi, best_color, (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        return best_color
+
+    def update_fsm(self, detected):
+        if detected == self.candidate:
+            self.candidate_count += 1
+        else:
+            self.candidate       = detected
+            self.candidate_count = 1
+        if self.candidate_count >= CONFIRM_FRAMES:
+            self.fsm_state = self.candidate
+
+    # =====================================================
+    # LOOP PRINCIPAL
+    # =====================================================
+
+    def process_frame(self):
+        frame = self._leer_frame()
+        if frame is None:
+            return
+
+        self.frame_n += 1
+        if self.frame_n % YOLO_EVERY_N == 0:
+            with self.yolo_lock:
+                if self.yolo_frame is None:
+                    self.yolo_frame = frame.copy()
+
+        sign_activa = self._actualizar_sign_fsm()
+        self.sign_pub.publish(String(data=sign_activa))
+        self.speed_pub.publish(Float32(data=self._speed_multiplier))
+
+        lane_error = self.detect_lane(frame)
+        detected   = self.detect_traffic_light(frame)
+        self.update_fsm(detected)
+
+        self.lane_pub.publish(Float32(data=float(lane_error)))
+        self.light_pub.publish(String(data=self.fsm_state))
+        self.curve_pub.publish(String(data=self.modo))
+        self.dash_pub.publish(String(data=self.dash_estado))
+
+        # ── HUD ───────────────────────────────────────────
+        h, w    = frame.shape[:2]
+        split_y = int(h * ROI_SPLIT)
+        cv2.line(frame, (0, split_y), (w, split_y), (0, 255, 255), 2)
+        if self.modo == "NORMAL":
+            zm = int(w * CENTER_MIN_RATIO)
+            zx = int(w * CENTER_MAX_RATIO)
+            cv2.line(frame, (zm, split_y), (zm, h), (0, 255, 0), 1)
+            cv2.line(frame, (zx, split_y), (zx, h), (0, 255, 0), 1)
+
+        # Bboxes — resalta la señal candidata activa en amarillo
+        for entry in self.last_boxes:
+            (x1, y1, x2, y2), lb, c, dist = entry
+            es_candidata = (lb == self._sign_candidate)
+            color = (0, 255, 255) if es_candidata else (0, 255, 128)
+            grosor = 3 if es_candidata else 1
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, grosor)
+            cv2.putText(frame, f"{lb} d∝{dist:.1f}", (x1, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+
+        color_modo = (0, 200, 0) if self.modo == "NORMAL" else (0, 120, 255)
+        lado_str   = f"({self.lado_curva})" if self.lado_curva else ""
+        dash_label = {"SOLIDA": "", "PAUSA": " [DASH-PAUSA]", "RECTO": " [DASH-RECTO]"}
+        cruce_str  = " [CRUCE]" if self.en_cruce else ""
+        sign_state_label = {
+            "IDLE": "", "TURNING": f" [{self._sign_turn_dir}]",
+            "REINCORP": " [REINCORP]", "STOPPING": " [STOP]", "SLOWING": " [50%]"
+        }.get(self._sign_action_state, "")
+
+        # Indicador de candidato en progreso
+        cand_str = ""
+        if self._sign_candidate != "NONE":
+            cand_str = f" [{self._sign_candidate} {self._sign_candidate_count}/{SIGN_CONFIRM_FRAMES}]"
+
+        cv2.putText(frame, f"LIGHT: {self.fsm_state}",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        cv2.putText(frame, f"SIGN:  {sign_activa}{sign_state_label}{cand_str}",
+                    (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 128), 2)
+        cv2.putText(frame, f"SPEED: {self._speed_multiplier:.0%}",
+                    (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+        cv2.putText(frame, f"ERROR: {lane_error:+.1f}px",
+                    (10, split_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 50, 50), 2)
+        cv2.putText(frame, f"MODO: {self.modo}{dash_label.get(self.dash_estado,'')}{cruce_str} {lado_str}",
+                    (10, split_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.70, color_modo, 2)
+        cv2.putText(frame, f"LOST: {self.lost_frames}",
+                    (10, split_y + 78), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (180, 180, 180), 1)
+
+        if self.has_display:
+            cv2.imshow("Camera", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.get_logger().info("Saliendo por tecla Q")
+                rclpy.shutdown()
+
+    # =====================================================
+    # DESTRUCTOR
+    # =====================================================
+
+    def destroy_node(self):
+        self.yolo_running = False
+        if self.yolo_thread.is_alive():
+            self.yolo_thread.join(timeout=2.0)
+        self.gst_pipeline.set_state(Gst.State.NULL)
+        if self.has_display:
+            cv2.destroyAllWindows()
+        super().destroy_node()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VisionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
+
